@@ -1,0 +1,21 @@
+// for (;;) {
+    //     vl53l7cx_check_data_ready(&dev, &ready);
+    //     if (ready) {
+    //         vl53l7cx_get_ranging_data(&dev, &res);
+
+    //         for (int r = 0; r < 8; r++) {
+    //             for (int c = 0; c < 8; c++) {
+    //                 int i = r * 8 + c;
+    //                 if (res.target_status[i] == 5 || res.target_status[i] == 9) {
+    //                     printf("%6d", res.distance_mm[i]);
+    //                 } else {
+    //                     printf("     -");
+    //                 }
+    //             }
+                
+    //             printf("\r\n");
+    //         }
+    //         printf("\r\n");
+    //     }
+    //     HAL_Delay(5);
+    // }
