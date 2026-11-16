@@ -187,6 +187,83 @@ void frame_send_ranging(const VL53L7CX_ResultsData *res,
     UART_API_Write(wire, wire_len);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Extended frame: base record + signal_per_spad + ambient_per_spad         */
+/* ------------------------------------------------------------------------- */
+
+static uint16_t clamp_u16(uint32_t v)
+{
+    return (v > 0xFFFFU) ? 0xFFFFU : (uint16_t)v;
+}
+
+uint16_t frame_build_ranging_ext(uint8_t *buf, uint16_t buf_len,
+                                 const VL53L7CX_ResultsData *res,
+                                 uint8_t grid_width,
+                                 uint32_t seq, uint32_t timestamp_ms)
+{
+    if ((buf == NULL) || (res == NULL)) {
+        return 0;
+    }
+    if ((grid_width != 4U) && (grid_width != 8U)) {
+        return 0;
+    }
+
+    const uint16_t zones = (uint16_t)grid_width * (uint16_t)grid_width;
+    const uint16_t body  = FRAME_HEADER_LEN
+                         + (uint16_t)(zones * ZONE_RECORD_LEN_EXT)
+                         + FRAME_CRC_LEN;
+
+    if (buf_len < body) {
+        return 0;
+    }
+
+    uint16_t off = 0;
+    off = put_u8 (buf, off, PROTO_VERSION);
+    off = put_u8 (buf, off, FRAME_TYPE_RANGING_EXT);
+    off = put_u8 (buf, off, grid_width);
+    off = put_u32(buf, off, seq);
+    off = put_u32(buf, off, timestamp_ms);
+
+    for (uint16_t i = 0; i < zones; i++) {
+        const uint16_t k = (uint16_t)(i * VL53L7CX_NB_TARGET_PER_ZONE);
+
+        off = put_u16(buf, off, (uint16_t)(int16_t)res->distance_mm[k]);
+        off = put_u16(buf, off, (uint16_t)res->range_sigma_mm[k]);
+        off = put_u8 (buf, off, res->target_status[k]);
+
+        /* signal_per_spad is per-target (index k); ambient_per_spad is
+         * per-zone (index i, shared across targets). Both are kcps/spad
+         * as uint32 in the driver -- clamp to uint16 for the wire, which
+         * is fine for trend logging (values realistically stay well
+         * under 65535 kcps/spad on this sensor). */
+        off = put_u16(buf, off, clamp_u16(res->signal_per_spad[k]));
+        off = put_u16(buf, off, clamp_u16(res->ambient_per_spad[i]));
+    }
+
+    off = put_u16(buf, off, crc16_ccitt(buf, off));
+
+    return off;
+}
+
+void frame_send_ranging_ext(const VL53L7CX_ResultsData *res,
+                            uint8_t grid_width, uint32_t seq)
+{
+    static uint8_t body[FRAME_BODY_MAX];
+    static uint8_t wire[FRAME_WIRE_MAX];
+
+    const uint16_t body_len = frame_build_ranging_ext(body, sizeof(body), res,
+                                                      grid_width, seq,
+                                                      HAL_GetTick());
+    if (body_len == 0U) {
+        return;
+    }
+
+    uint16_t wire_len = cobs_encode(body, body_len, wire);
+    wire[wire_len++] = 0x00;
+
+    UART_API_Write(wire, wire_len);
+}
+
 void frame_send_text(const char *msg)
 {
     static uint8_t body[FRAME_BODY_MAX];

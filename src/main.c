@@ -21,7 +21,14 @@
 #define CENTER_ONLY   0       /* use only the middle 4x4         */
 
 static bool led_on = false;
-int16_t g_trigger_mm = 500;    /* <-- the distance you care about */
+int16_t g_trigger_mm = 915;    /* <-- the distance you care about */
+
+/* Set by EXTI4 ISR (GP_TOF_INT), consumed by the main loop. Replaces the
+ * fixed HAL_Delay(5) poll: the sensor tells us exactly when a frame is
+ * ready instead of us guessing. NOTE: PA4/EXTI4 mapping for GP_TOF_INT is
+ * still UNVERIFIED per VL53L7CX_ROADMAP.md section 3 -- confirm against
+ * the UM3067 schematic if this never fires. */
+static volatile bool g_tof_int_flag = false;
 
 
 I2C_HandleTypeDef hi2c1;                        /* Struct that holds info that HAL needs to manage one I2C peripheral instance*/
@@ -77,6 +84,41 @@ static void I2C1_Scan(void)
 }
 
 
+
+/* GP_TOF_INT lives on PA4 (see gpio_api.c). Re-init that one pin in
+ * interrupt mode -- GPIO_API_Init() already set it up as a plain
+ * pulled-up input, this layers EXTI on top without touching anything else. */
+static void TOF_INT_EXTI_Init(void)
+{
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
+
+    GPIO_InitTypeDef g = {0};
+    g.Pin   = GPIO_PIN_4;
+    g.Mode  = GPIO_MODE_IT_FALLING;   /* INT is open-drain, active low, pulled up */
+    g.Pull  = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    HAL_NVIC_SetPriority(EXTI4_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+}
+
+/* Weak default lives in stm32f4xx_hal_gpio.c; this override is what actually
+ * runs. Keep it tiny -- it executes at interrupt priority 2. */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_4) {
+        g_tof_int_flag = true;
+    }
+}
+
+/* The vector table's default handler for this line is a weak infinite loop
+ * (no stm32f4xx_it.c exists in this project) -- this definition is what
+ * gets linked instead. */
+void EXTI4_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
+}
 
 static void proximity_update(const VL53L7CX_ResultsData *res)
 {
@@ -171,26 +213,52 @@ int main(void)
     vl53l7cx_set_resolution(&dev, VL53L7CX_RESOLUTION_8X8);   /* before frequency */
     vl53l7cx_set_target_order(&dev, VL53L7CX_TARGET_ORDER_CLOSEST);
     vl53l7cx_set_ranging_frequency_hz(&dev, 15);
+
+    /* Explicit integration time. Must stay below the ranging period
+     * (1000/freq_hz ms) -- at 15 Hz that's a 66 ms budget, so 20 ms leaves
+     * comfortable headroom. Longer integration = more collected photons =
+     * better SNR at range, at the cost of motion blur on fast-moving
+     * targets. Bump this toward the ~60 ms ceiling for max-range bench
+     * tests on a static target; drop it back down for the pendulum/
+     * reaction-time test where you want the sharpest possible timing. */
+    st = vl53l7cx_set_integration_time_ms(&dev, 20);
+    printf("set_integration_time_ms(20): status=%u\r\n", st);
+
+    uint32_t itime = 0;
+    vl53l7cx_get_integration_time_ms(&dev, &itime);
+    printf("integration time readback: %lu ms\r\n", (unsigned long)itime);
+
     vl53l7cx_start_ranging(&dev);
+    TOF_INT_EXTI_Init();   /* after start_ranging: sensor now drives INT low on new data */
 
     static VL53L7CX_ResultsData res;
     uint8_t ready = 0;
 
 
-    /* Polling for data. Check data ready sets ready to 1 when a complete new frame is sitting in sensor's buffer 
-        TODO: Config EXTI interrupt so we can remove the polling, place get_ranging_data inside the ISR
-    */
+    /* Interrupt-driven: GP_TOF_INT (PA4) pulses low when a frame is ready,
+     * EXTI4_IRQHandler -> HAL_GPIO_EXTI_Callback sets g_tof_int_flag, and
+     * the loop below just drains it. No fixed HAL_Delay poll interval
+     * means no added latency/jitter between "frame ready" and "frame read" --
+     * useful for the reaction-time / motion test. */
 
         uint32_t seq = 0;
 
         for (;;) {
-            vl53l7cx_check_data_ready(&dev, &ready);
-            if (ready) {
-                vl53l7cx_get_ranging_data(&dev, &res);
-                frame_send_ranging(&res, 8, seq++);
-                proximity_update(&res);
+            if (g_tof_int_flag) {
+                g_tof_int_flag = false;
+                vl53l7cx_check_data_ready(&dev, &ready);
+                if (ready) {
+                    vl53l7cx_get_ranging_data(&dev, &res);
+                    /* _ext variant adds signal_per_spad + ambient_per_spad
+                     * per zone, for range/SNR characterization logging
+                     * (see tools/csv_logger.py). Switch back to plain
+                     * frame_send_ranging() if you need the higher frame
+                     * rate headroom instead. */
+                    frame_send_ranging_ext(&res, 8, seq++);
+                    proximity_update(&res);
+                }
             }
-            HAL_Delay(5);
+            __WFI();   /* sleep until the next interrupt (EXTI4 or SysTick) */
         }
 
 

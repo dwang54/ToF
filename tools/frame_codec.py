@@ -29,15 +29,15 @@ import struct
 HEADER_FMT = '<BBBII'
 HEADER_LEN = struct.calcsize(HEADER_FMT)      # 11
 RECORD_LEN = 5
+RECORD_LEN_EXT = 9        # base 5 + uint16 signal_kcps + uint16 ambient_kcps
 CRC_LEN = 2
- 
+
 PROTO_VERSION = 0x01
 TYPE_RANGING = 0x01
 TYPE_TEXT = 0x02
- 
-MAX_FRAME = 4096          # buffer guard: bigger than any legal frame
- 
- 
+TYPE_RANGING_EXT = 0x03
+
+MAX_FRAME = 4096          # buffer guard: bigger than any legal frame 
 # --------------------------------------------------------------------------
 # CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final xor.
 # Check value: crc16_ccitt(b"123456789") == 0x29B1
@@ -124,44 +124,56 @@ def build_frame(seq, timestamp_ms, grid_width, distances, sigmas, statuses,
  
 def decode_frame(raw):
     """Parse one COBS-decoded frame body.
- 
+
     Returns a dict, or None if the frame is malformed. Never raises --
     corrupt input is expected on a serial link, not exceptional.
     """
     if len(raw) < HEADER_LEN + CRC_LEN:
         return None
- 
+
     version, ftype, grid_width, seq, ts = struct.unpack_from(HEADER_FMT, raw, 0)
- 
+
     if version != PROTO_VERSION:
         return None
     if grid_width not in (4, 8):
         return None
- 
+    if ftype not in (TYPE_RANGING, TYPE_RANGING_EXT):
+        return None
+
     n_zones = grid_width * grid_width
-    expected = HEADER_LEN + n_zones * RECORD_LEN + CRC_LEN
+    record_len = RECORD_LEN_EXT if ftype == TYPE_RANGING_EXT else RECORD_LEN
+    expected = HEADER_LEN + n_zones * record_len + CRC_LEN
     if len(raw) != expected:
         return None
- 
+
     got = struct.unpack_from('<H', raw, expected - CRC_LEN)[0]
     if crc16_ccitt(raw[:expected - CRC_LEN]) != got:
         return None
- 
-    # One unpack for all zones; far faster and less error-prone than
-    # slicing each record individually.
-    flat = struct.unpack_from('<' + 'hHB' * n_zones, raw, HEADER_LEN)
- 
-    return {
+
+    result = {
         'type': ftype,
         'seq': seq,
         'timestamp_ms': ts,
         'grid_width': grid_width,
-        'distances': flat[0::3],
-        'sigmas': flat[1::3],
-        'statuses': flat[2::3],
     }
- 
- 
+
+    if ftype == TYPE_RANGING_EXT:
+        # One unpack for all zones: distance, sigma, status, signal, ambient.
+        flat = struct.unpack_from('<' + 'hHBHH' * n_zones, raw, HEADER_LEN)
+        result['distances'] = flat[0::5]
+        result['sigmas'] = flat[1::5]
+        result['statuses'] = flat[2::5]
+        result['signals'] = flat[3::5]
+        result['ambients'] = flat[4::5]
+    else:
+        # One unpack for all zones; far faster and less error-prone than
+        # slicing each record individually.
+        flat = struct.unpack_from('<' + 'hHB' * n_zones, raw, HEADER_LEN)
+        result['distances'] = flat[0::3]
+        result['sigmas'] = flat[1::3]
+        result['statuses'] = flat[2::3]
+
+    return result 
 # --------------------------------------------------------------------------
 # Stream reassembly
 # --------------------------------------------------------------------------

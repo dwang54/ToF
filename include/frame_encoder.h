@@ -35,14 +35,19 @@ extern "C" {
 #define PROTO_VERSION       0x01
 #define FRAME_TYPE_RANGING  0x01
 #define FRAME_TYPE_TEXT     0x02
+#define FRAME_TYPE_RANGING_EXT 0x03  /* adds signal_per_spad + ambient_per_spad, for range/SNR characterization */
 
 #define FRAME_HEADER_LEN    11
 #define ZONE_RECORD_LEN     5
+#define ZONE_RECORD_LEN_EXT 9   /* base 5 + uint16 signal_kcps + uint16 ambient_kcps */
 #define FRAME_CRC_LEN       2
 
 /* Worst case is 8x8: 11 + 320 + 2 = 333 body bytes. COBS adds at most
- * len/254 + 1, then one delimiter byte. Size for 8x8 even at 4x4. */
-#define FRAME_BODY_MAX      (FRAME_HEADER_LEN + 64 * ZONE_RECORD_LEN + FRAME_CRC_LEN)
+ * len/254 + 1, then one delimiter byte. Size for 8x8 even at 4x4.
+ * The EXT variant is 11 + 64*9 + 2 = 589 bytes -- FRAME_BODY_MAX below
+ * already covers it since it's sized off the larger of the two record
+ * lengths. */
+#define FRAME_BODY_MAX      (FRAME_HEADER_LEN + 64 * ZONE_RECORD_LEN_EXT + FRAME_CRC_LEN)
 #define FRAME_WIRE_MAX      (FRAME_BODY_MAX + FRAME_BODY_MAX / 254 + 2)
 
 /* --- little-endian writers ---------------------------------------------- */
@@ -71,11 +76,25 @@ uint16_t frame_build_ranging(uint8_t *buf, uint16_t buf_len,
                              uint8_t grid_width,
                              uint32_t seq, uint32_t timestamp_ms);
 
+/* Extended variant: adds signal_per_spad_kcps + ambient_per_spad_kcps per
+ * zone (each truncated/clamped to uint16 -- plenty of precision for trend
+ * logging, not meant for calibration-grade analysis). Use this for range/
+ * SNR characterization tests; use the plain variant for normal streaming
+ * since it's ~1.7x the bytes on the wire per frame. */
+uint16_t frame_build_ranging_ext(uint8_t *buf, uint16_t buf_len,
+                                 const VL53L7CX_ResultsData *res,
+                                 uint8_t grid_width,
+                                 uint32_t seq, uint32_t timestamp_ms);
+
 /* --- send ---------------------------------------------------------------- */
 /* Builds, CRCs, COBS-encodes and transmits one frame in a single UART write.
  * One frame = one message; never split it across calls. */
 void frame_send_ranging(const VL53L7CX_ResultsData *res,
                         uint8_t grid_width, uint32_t seq);
+
+/* Extended-record counterpart of frame_send_ranging(). */
+void frame_send_ranging_ext(const VL53L7CX_ResultsData *res,
+                            uint8_t grid_width, uint32_t seq);
 
 /* Lets log messages share the UART with binary frames. A bare printf would
  * merge into the next frame and corrupt it -- ASCII contains no 0x00. */

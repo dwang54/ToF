@@ -11,7 +11,9 @@ Usage:
 """
 
 import argparse
+import json
 import math
+import os
 import sys
 import time
 
@@ -28,8 +30,10 @@ SENSOR_FOV = 60.0          # degrees, per axis (the 90 deg figure is diagonal)
 
 VALID_STATUS = (5, 9)      # 5 = valid, 9 = valid but possibly merged targets
 SIGMA_MAX_MM = 15          # reject zones the sensor is unsure about
-MIN_DIST_MM = 10           # sensor's physical minimum
-MAX_DIST_MM = 1500         # tighten to your scene; strays drag the camera out
+# >>> CHANGE MINIMUM DETECTION DISTANCE HERE <<<
+# Zones closer than this are ignored. mm = inches * 25.4  (8 in = 203.2 mm)
+MIN_DIST_MM = 203          # 8 inches
+MAX_DIST_MM = 1050         # tighten to your scene; strays drag the camera out
 
 # RANSAC. 64 points is a sparse fit, so keep the tolerance generous --
 # too tight and it latches onto spurious subsets instead of the real plane.
@@ -43,6 +47,19 @@ CLUSTER_EPS_M = 0.25
 CLUSTER_MIN_PTS = 3
 
 RAY_COLOR = (0.30, 0.30, 0.35)     # dim: 64 bright lines drown the points
+
+# Zones to ignore entirely, loaded from zone_map.py's JSON (see --mask).
+# Empty set = no exclusions.
+EXCLUDED_ZONES = set()
+
+
+def load_zone_mask(path):
+    """Load zone_map.py's exclusion JSON into EXCLUDED_ZONES."""
+    global EXCLUDED_ZONES
+    with open(path) as f:
+        data = json.load(f)
+    EXCLUDED_ZONES = set(data.get('excluded', []))
+    print(f'zone mask: excluding {len(EXCLUDED_ZONES)} zones from {path}')
 
 
 def zone_angles(g_width):
@@ -102,8 +119,10 @@ def zone_mask(frame):
     ok_status = np.isin(status, VALID_STATUS)
     ok_sigma = sigma <= SIGMA_MAX_MM
     ok_range = (dist >= MIN_DIST_MM) & (dist <= MAX_DIST_MM)
+    ok_zone = ~np.isin(np.arange(status.size), list(EXCLUDED_ZONES)) \
+        if EXCLUDED_ZONES else np.ones(status.size, dtype=bool)
 
-    mask = ok_status & ok_sigma & ok_range
+    mask = ok_status & ok_sigma & ok_range & ok_zone
 
     counts = {
         'total': mask.size,
@@ -111,6 +130,7 @@ def zone_mask(frame):
         'bad_status': int((~ok_status).sum()),
         'bad_sigma': int((ok_status & ~ok_sigma).sum()),
         'bad_range': int((ok_status & ok_sigma & ~ok_range).sum()),
+        'excluded': int((ok_status & ok_sigma & ok_range & ~ok_zone).sum()),
     }
     return mask, counts
 
@@ -278,6 +298,7 @@ class CloudViewer:
         dist = np.asarray(frame['distances'], dtype=float)
         all_pts = rad_to_cartesian(dist, n) / 1000.0   # mm -> metres
         pts = all_pts[mask]
+        radial_mm = dist[mask]      # raw sensor distance_mm, pre-projection
 
         self._clear_boxes()
 
@@ -286,7 +307,7 @@ class CloudViewer:
             self.pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
             self._update_rays(pts)
             self._render()
-            self._report(frame, counts, 0, None, pts)
+            self._report(frame, counts, 0, None, pts, radial_mm)
             return
 
         plane_pts = np.zeros((0, 3))
@@ -324,9 +345,9 @@ class CloudViewer:
         self.pcd.points = o3d.utility.Vector3dVector(pts)
         self.pcd.colors = o3d.utility.Vector3dVector(cols)
         self._render()
-        self._report(frame, counts, n_clusters, plane_model, pts)
+        self._report(frame, counts, n_clusters, plane_model, pts, radial_mm)
 
-    def _report(self, frame, counts, n_clusters, plane_model, pts):
+    def _report(self, frame, counts, n_clusters, plane_model, pts, radial_mm):
         if not self.verbose:
             return
         now = time.time()
@@ -338,10 +359,17 @@ class CloudViewer:
                f"{counts['kept']}/{counts['total']} zones  "
                f"(status {counts['bad_status']}, "
                f"sigma {counts['bad_sigma']}, "
-               f"range {counts['bad_range']} rejected)")
-        if len(pts):
-            msg += (f"  near {pts[:, 2].min() * 1000:.0f} mm"
-                    f"  far {pts[:, 2].max() * 1000:.0f} mm")
+               f"range {counts['bad_range']}, "
+               f"masked {counts.get('excluded', 0)} rejected)")
+        if len(radial_mm):
+            # Radial distance_mm (raw sensor reading), NOT the Cartesian Z
+            # depth -- Z is foreshortened for off-axis zones (corner/edge
+            # zones project to a smaller Z than their true straight-line
+            # range), so reporting Z here made kept zones look like they
+            # were outside the [MIN_DIST_MM, MAX_DIST_MM] filter when they
+            # were not. This matches the band the filter actually applies.
+            msg += (f"  near {radial_mm.min():.0f} mm"
+                    f"  far {radial_mm.max():.0f} mm")
         if plane_model is not None:
             a, b, c, d = plane_model
             msg += f"  plane n=({a:.2f},{b:.2f},{c:.2f}) at {abs(d):.2f} m"
@@ -462,7 +490,17 @@ if __name__ == '__main__':
     ap.add_argument('--replay', help='play back a recording instead')
     ap.add_argument('--delay', type=float, default=0.1)
     ap.add_argument('--loop', action='store_true', help='repeat the recording')
+    ap.add_argument('--mask', default=os.path.join(os.path.dirname(__file__),
+                                                   'zone_mask.json'),
+                    help='zone exclusion JSON from zone_map.py '
+                         '(default: tools/zone_mask.json if present; '
+                         'pass --mask "" to disable)')
     args = ap.parse_args()
+
+    if args.mask and os.path.exists(args.mask):
+        load_zone_mask(args.mask)
+    elif args.mask:
+        print(f'note: no mask file at {args.mask}, showing all zones')
 
     if args.replay:
         run_replay(args.replay, args.plane, args.cluster, args.delay, args.loop)
